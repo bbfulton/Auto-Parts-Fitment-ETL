@@ -1,0 +1,803 @@
+---
+title: "Data Preparation in R"
+output: html_document
+---
+
+The purpose of this project is to extract used parts information from 5 separate data tables and combine it in such a way that we can upload the resulting csv file into our website's online store back end. Most of the information in these 5 raw data tables has been collected over a two decade time span by several different internal users with only other internal users in mind, so there is very little standardization to lean on.
+
+# Loading required packages and reading in the Data
+
+```{r Loading packages, message = FALSE}
+
+require(RODBC)
+require(sqldf)
+require(dplyr)
+require(stringr)
+require(stringi)
+require(magrittr)
+chan <- odbcConnect("Fitrix Live Data")
+
+```
+
+Reading in the raw data tables.  cwifittd contains coded information regarding year, make, model and part numbers.  'fitted' contains uncoded vehicle types/names.  invmast contains a large amount of information related to warehousing of parts; for our purposes, we are mostly interested in descriptions and names of parts in this table.
+
+```{r Loading data}
+
+cwifittd <- sqlFetch(channel = chan, sqtable = "informix.cwifittd", colnames = FALSE, rows_at_time = 2500)
+isna <- apply(cwifittd, 2, function(x) sum(is.na(x)))
+cwifittd <- cwifittd[,-which(isna >= 0.9*max(isna))]
+fitted <- read.csv("C:\\Fitrix Data Tables for R\\Used\\fitted.csv", skipNul = TRUE)
+invmast <- read.csv("C:\\Fitrix Data Tables for R\\Used\\invmast.csv", skipNul = TRUE)
+
+```
+
+Filter out all non-used parts from our tables.
+
+```{r Used parts}
+
+cwifittd$item_code <- trimws(cwifittd$item_code)
+used.parts <- grep(".*U", cwifittd$item_code, ignore.case = TRUE)
+cwifittd <- cwifittd[used.parts,]
+names(fitted) <- tolower(names(fitted))
+names(invmast) <- tolower(names(invmast))
+invmast$fxitem <- trimws(invmast$fxitem)
+used.parts <- grep(".*U", invmast$fxitem, ignore.case = TRUE)
+invmast <- invmast[used.parts,]
+invmast <- select(invmast, fpartno, fxitem, fdesc, fbdesc)
+
+```
+
+Since the fitted table contains useful raw data but little useful information for an externaluser, we combine it with invmast that contains more descriptive information about each part.
+
+```{r Merging tables}
+
+fitted <- merge(fitted, invmast, by = intersect("fpartno", "fpartno"))
+rm(invmast)
+head(fitted,3)
+
+```
+
+stiinvtr contains a large amount of information about each part in our warehouse, including conventional naming and descriptive information about each part that we're interested in.  
+
+```{r Reading in more data}
+
+stiinvtr <- sqlFetch(channel = chan, sqtable = "informix.stiinvtr", colnames = FALSE, rows_at_time = 2500)
+
+```
+
+stiinvtr is a very large table that takes up a lot of space in memory, so it's useful to filter out only the fields that we need
+
+```{r Trimming down stiinvtr}
+
+isna <- apply(stiinvtr, 2, function(x) sum(is.na(x)))
+stiinvtr <- stiinvtr[,-which(isna >= 0.9*max(isna))]
+stiinvtr <- stiinvtr[,c(1:5)]
+stiinvtr$item_class <- trimws(stiinvtr$item_class)
+stiinvtr <- stiinvtr %>% subset(item_class == "U-ROV" | item_class == "U-JAG")
+stiinvtr <- stiinvtr[,c(1,4)]
+stiinvtr$item_code <- as.character(stiinvtr$item_code)
+stiinvtr$item_code <- trimws(stiinvtr$item_code)
+
+```
+
+cwicartyp is a table that relates car models to their various engine options.
+
+```{r cwicartyp}
+
+cwicartyp <- sqlFetch(channel = chan, sqtable = "informix.cwicartyp", colnames = FALSE)
+head(cwicartyp, 2)
+
+```
+
+Combining cwifittd and cwicartyp gives us a table that gives us all of the information about each car model we sell parts for and will help us with creating fitment tables for each part.
+
+```{r Merging cwifittd and cwicartyp}
+
+new.fitted <- merge(cwifittd, cwicartyp, 
+                by = intersect(c("carnum", "carmod"), c("carnum", "carmod")), 
+                all.y = FALSE)
+new.fitted <- new.fitted[,c(8:14)]
+
+new.fitted <- merge(new.fitted, stiinvtr, by = intersect("item_code", "item_code"))
+new.fitted <- droplevels(new.fitted)
+head(new.fitted,3)
+
+```
+
+new.fitted is a table of parts that were added into our system past a certain date
+old.fitted is a table of parts that were added into our system before a certain date
+
+```{r New vs Old}
+
+old.fitted <- merge(fitted, stiinvtr, by.x = "fxitem", by.y = "item_code", all = FALSE)
+old.fitted <- old.fitted[,-c(2,5,8:14)]
+rm(stiinvtr);rm(cwicartyp); rm(cwifittd)
+head(old.fitted,3)
+
+```
+
+Formatting/normalizing year fields for existing (non-NA) year values
+
+```{r Years}
+
+old.fitted$fbyear[which(!is.na(old.fitted$fbyear))] <- as.integer(paste(19, old.fitted$fbyear[which(!is.na(old.fitted$fbyear))], sep = ""))
+old.fitted$feyear[which(!is.na(old.fitted$feyear))] <- as.integer(paste(19, old.fitted$feyear[which(!is.na(old.fitted$feyear))], sep = ""))
+
+```
+
+Since these data tables have been appended to for over 20 years, there are some models that we no longer support that are still our data tables.  We have to remove the models for which we no longer carry parts.
+
+```{r No longer service}
+
+models.keep <- grep("XJ6.*|XJS.*|XK8.*|XJ1.*|XJ8.*", old.fitted$fcartype, ignore.case = TRUE)
+old.fitted <- old.fitted[models.keep,]
+models.discard <- grep("XJ6/1.*|XJ6/2.*|XKE.*|E/V12", old.fitted$fcartype, ignore.case = TRUE)
+old.fitted <- old.fitted[-models.discard,]
+old.fitted <- droplevels(old.fitted)
+
+```
+
+Standardizing fields in new and old fitment tables to make merging easier
+
+```{r Standardizing new.fitted and old.fitted}
+
+names(new.fitted) <- c("item_code", "modellong", "engtype", "byear", "eyear", "model", "manufacturer", "desc")
+names(old.fitted) <- c("item_code", "manufacturer", "model", "byear", "eyear", "desc1", "desc2", "desc")
+new.fitted <- new.fitted[,c(1,7,6,4,5,8,2,3)]
+new.fitted <- new.fitted %>% mutate(desc1 = NA,
+                                    desc2 = NA)
+old.fitted <- old.fitted %>% mutate(engtype = NA,
+                                    modellong = NA)
+old.fitted <- old.fitted[,c(1:5,8:10,6:7)]
+
+```
+
+Creating new fitment table that combines both new and old fitment information
+
+```{r New fitment table}
+
+update.fitted <- as.data.frame(matrix(data = NA, nrow = 0, ncol = 10))
+names(update.fitted) <- c("item_code", "manufacturer", "model", "byear", "eyear", "desc", "modellong", "engtype", "desc1", "desc2")
+update.fitted <- rbind(update.fitted, new.fitted, old.fitted)
+head(update.fitted,3)
+
+```
+
+# Creating Pricing Structure
+
+Unlike with new parts, our pricing structure for used parts is non-standardized and informal.  As such, it was determined that the best way to generate a list of used parts prices was to base each price off of recent sales history for that particular item. stoordrd contains sales  history for every specific part we have sold in the past 10 years, so we will use that to create standardized prices for the used parts that we want to sell.  This is the last data table we'll need to read from the RODBC connection, we can go ahead and close that connection.
+
+```{r Used parts pricing structure}
+
+stoordrd <- sqlFetch(channel = chan, sqtable = "informix.stoordrd", colnames = FALSE, rows_at_time = 2500)
+stoordrd <- select(stoordrd, item_code, desc1, price)
+stoordrd$item_code <- as.character(stoordrd$item_code)
+stoordrd$item_code <- trimws(stoordrd$item_code)
+close(chan)
+
+```
+
+Extracting only used parts sales from stoordrd
+
+```{r stoordrd}
+
+used <- unique(c(new.fitted$item_code, fitted$fxitem))
+used.parts <- which(stoordrd$item_code %in% used)
+stoordrd <- stoordrd[used.parts,]
+stoordrd <- merge(stoordrd, update.fitted, by = intersect("item_code", "item_code"), all.x = FALSE)
+
+```
+
+This function takes an aggregated mean of sales prices for each individual part and applies a rounding formula to generate a new standardized price for each part.  It's difficult to ship very large items or to obtain very small used parts, so we will filter out any item that fits into one of those extremes by assuming that large items will cost the most and small items will cost the least.
+
+```{r Price aggregation}
+
+price.function <- function(price) {
+      x <- ifelse(mean(price) < 100, round(signif(mean(price), 1)), round(signif(mean(price), 2)))
+      return(x)
+}
+
+part.prices <- select(stoordrd, item_code, price)
+part.prices <- aggregate(price ~ item_code, 
+                         data = part.prices,
+                         FUN = price.function)
+part.prices <- filter(part.prices, price < 1000 & price > 4) 
+
+```
+
+Merge the new standardized part prices with our complete fitment table
+
+```{r Merge prices with fitment}
+
+update.fitted <- merge(update.fitted, part.prices, by = intersect("item_code", "item_code"))
+
+rm(fitted); rm(new.fitted); rm(old.fitted); rm(stoordrd); rm(part.prices)
+rm(isna); rm(models.discard); rm(models.keep); rm(used); rm(used.parts)
+  
+
+```
+
+# Extensive Data Cleaning and Normalization
+
+As noted above, most of our data is primarily constructed for internal usage and not for consumers to see.  As such, much of the information is not "neat" or easily understood by anyone who isn't familiar with our system. Additionally, since the primary goal is to output a csv file that is in the exact format that our website's back-end requires, there will be a lot of time devoted to formatting our data from here on out.  
+
+```{r Removing used tag from description}
+
+update.fitted$desc <- gsub(",U ", ", ", update.fitted$desc)
+update.fitted$desc1 <- gsub("[\\]U ", " ", update.fitted$desc1)
+
+```
+
+There are multiple description fields for each part; a name, a short description, and a (potentially) longer description to extract.
+
+```{r Ugly but necessary coding here}
+
+update.fitted$desc <- sapply(1:nrow(update.fitted), function(x) paste(str_split_fixed(str_split_fixed(update.fitted$desc[x], ",", n = 2)[2], " ", n = 4)[2],
+                                                                      str_split_fixed(str_split_fixed(update.fitted$desc[x], ",", n = 2)[2], " ", n = 4)[3],
+                                                                      str_split_fixed(update.fitted$desc[x], ",", n = 2)[1],
+                                                                      str_split_fixed(str_split_fixed(update.fitted$desc[x], ",", n = 2)[2], " ", n = 4)[4]))
+update.fitted$desc1 <- sapply(1:nrow(update.fitted), function(x) paste(str_split_fixed(str_split_fixed(update.fitted$desc1[x], ",", n = 2)[2], " ", n = 4)[2],
+                                                                       str_split_fixed(str_split_fixed(update.fitted$desc1[x], ",", n = 2)[2], " ", n = 4)[3],
+                                                                       str_split_fixed(update.fitted$desc1[x], ",", n = 2)[1],
+                                                                       str_split_fixed(str_split_fixed(update.fitted$desc1[x], ",", n = 2)[2], " ", n = 4)[4]))
+update.fitted <- droplevels(update.fitted)
+
+```
+
+Imputing year fitment.  For parts that have blank year fitments, we can impute the missing values based on the model field.  Some are more complicated than others.  
+
+```{r Imputing years}
+
+update.fitted$model <- trimws(update.fitted$model)
+update.fitted$byear[which(update.fitted$model == "XJ6/3" & is.na(update.fitted$byear))] <- 1979
+update.fitted$eyear[which(update.fitted$model == "XJ6/3" & is.na(update.fitted$eyear))] <- 1987
+update.fitted$byear[which(update.fitted$model == "XJ6/2" & is.na(update.fitted$byear))] <- 1974
+update.fitted$eyear[which(update.fitted$model == "XJ6/2" & is.na(update.fitted$eyear))] <- 1979
+update.fitted$byear[which(update.fitted$model == "XJ6/1" & is.na(update.fitted$byear))] <- 1969
+update.fitted$eyear[which(update.fitted$model == "XJ6/1" & is.na(update.fitted$eyear))] <- 1973
+update.fitted$byear[intersect(grep("^XJS.*HE", update.fitted$model), which(is.na(update.fitted$byear)))] <- 1982
+update.fitted$eyear[intersect(grep("^XJS.*HE", update.fitted$model), which(is.na(update.fitted$eyear)))] <- 1993
+update.fitted$byear[intersect(grep("^XJS.*4.*", update.fitted$model), which(is.na(update.fitted$byear)))] <- 1993
+update.fitted$eyear[intersect(grep("^XJS.*4.*", update.fitted$model), which(is.na(update.fitted$eyear)))] <- 1996
+update.fitted$byear[intersect(grep("^XJS.*5.*", update.fitted$model), which(is.na(update.fitted$byear)))] <- 1982
+update.fitted$eyear[intersect(grep("^XJS.*5.*", update.fitted$model), which(is.na(update.fitted$eyear)))] <- 1993
+update.fitted <- update.fitted[-1367,]
+update.fitted$byear[which(update.fitted$model == "XJS" & is.na(update.fitted$byear) & is.na(update.fitted$eyear))] <- 1982
+update.fitted$eyear[which(update.fitted$model == "XJS" & update.fitted$byear == 1982 & is.na(update.fitted$eyear))] <- 1989
+update.fitted$byear[which(update.fitted$model == "XJS" & is.na(update.fitted$byear))] <- 
+      ifelse(update.fitted$eyear[which(update.fitted$model == "XJS" & is.na(update.fitted$byear))] > 1992, 1993, 1982)
+update.fitted$eyear[which(update.fitted$model == "XJS" & is.na(update.fitted$eyear))] <- 
+      ifelse(update.fitted$byear[which(update.fitted$model == "XJS" & is.na(update.fitted$eyear))] > 1992, 1996, 1992)
+update.fitted$eyear[grep("^LR3.*", update.fitted$model)] <- 2009
+update.fitted$eyear[which(update.fitted$model == "RR 4.4")] <- 2005
+update.fitted <- update.fitted[-grep("RR/SP.*", update.fitted$model),]
+update.fitted$byear[which(update.fitted$model == "XJ12/2" & is.na(update.fitted$byear))] <- 1974
+update.fitted$eyear[which(update.fitted$model == "XJ12/2" & is.na(update.fitted$eyear))] <- 1979
+update.fitted$byear[which(update.fitted$model == "XJ12/4" & is.na(update.fitted$byear))] <- 1993
+update.fitted$eyear[which(update.fitted$model == "XJ12/4" & is.na(update.fitted$eyear))] <- 1994
+update.fitted$byear[which(update.fitted$model == "XJ12/5" & is.na(update.fitted$byear))] <- 1995
+update.fitted$eyear[which(update.fitted$model == "XJ12/5" & is.na(update.fitted$eyear))] <- 1997
+update.fitted$byear[which(update.fitted$model == "XJ12/5.3" & is.na(update.fitted$byear))] <- 1987
+update.fitted$eyear[which(update.fitted$model == "XJ12/5.3" & is.na(update.fitted$eyear))] <- 1988
+update.fitted$byear[which(update.fitted$model == "XJ12/HE" & is.na(update.fitted$byear))] <- 1987
+update.fitted$eyear[which(update.fitted$model == "XJ12/HE" & is.na(update.fitted$eyear))] <- 1988
+update.fitted$byear[which(update.fitted$model == "XJ8" & is.na(update.fitted$byear))] <- 1998
+update.fitted$eyear[which(update.fitted$model == "XJ8" & is.na(update.fitted$eyear))] <- 2003
+update.fitted$byear[which(update.fitted$model == "XK8" & is.na(update.fitted$byear))] <- 1997
+update.fitted$eyear[which(update.fitted$model == "XK8" & is.na(update.fitted$eyear))] <- 2002
+update.fitted$byear[which(update.fitted$model == "XJ6/5" & is.na(update.fitted$byear))] <- 1995
+update.fitted$eyear[which(update.fitted$model == "XJ6/5" & is.na(update.fitted$eyear))] <- 1997
+update.fitted <- update.fitted[-c(2,23),]
+update.fitted$byear[intersect(grep("^C.*", update.fitted$item_code), which(update.fitted$model == "XJ12" & is.na(update.fitted$byear)))] <- 1974
+update.fitted$eyear[intersect(grep("^C.*", update.fitted$item_code), which(update.fitted$model == "XJ12" & is.na(update.fitted$eyear)))] <- 1988
+update.fitted$byear[which(update.fitted$model == "XJ12" & is.na(update.fitted$byear))] <- 1993
+update.fitted$eyear[which(update.fitted$model == "XJ12" & is.na(update.fitted$eyear))] <- 1997
+update.fitted$byear[which(update.fitted$model == "XJ6/4" & is.na(update.fitted$byear) & update.fitted$eyear == 1992)] <- 1990
+update.fitted$byear[which(update.fitted$model == "XJ6/4" & is.na(update.fitted$byear) & update.fitted$eyear == 1994)] <- 1993
+update.fitted$eyear[which(update.fitted$model == "XJ6/4" & is.na(update.fitted$eyear) & update.fitted$byear == 1988)] <- 1989
+update.fitted$eyear[which(update.fitted$model == "XJ6/4" & is.na(update.fitted$eyear))] <- 1994
+update.fitted$byear[which(update.fitted$model == "XJ6/4" & is.na(update.fitted$byear))] <- 1988
+update.fitted$eyear[which(trimws(update.fitted$model) == "XF" & is.na(update.fitted$eyear))] <- 2009
+update.fitted$byear[which(update.fitted$model == "XJ6" & is.na(update.fitted$byear))] <- 1979
+update.fitted$eyear[which(update.fitted$model == "XJ6" & is.na(update.fitted$eyear) & update.fitted$byear == 1979)] <- 1987
+update.fitted$eyear[which(update.fitted$model == "XJ6" & is.na(update.fitted$eyear) & update.fitted$byear == 1988)] <- 1994
+update.fitted <- update.fitted[-1,]
+
+```
+
+Removing an older model that we no longer carry used parts for.  This should've been done in an earlier step, but it was overlooked.
+
+```{r}
+
+update.fitted <- update.fitted[-grep("^E|^XKE", update.fitted$model),]
+
+```
+
+Normalizing engine size information so that it is in the correct format for use with the website CMS.
+
+```{r Engine size}
+
+update.fitted$engtype <- trimws(update.fitted$engtype)
+update.fitted$engtype <- gsub(".*2.5.*", "2.5 ltr V6", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*3.0.*", "3.0 ltr V6", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*3.6.*", "3.6 ltr 6 cyl", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*3.9.*", "3.9 ltr V8", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*6.0.*", "6.0 ltr V12", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*5.3.*", "5.3 ltr V12", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*4.6.*", "4.6 ltr V8", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*4.4.*", "4.4 ltr V8", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*4.0.*6.*S/C.*", "4.0 ltr 6 cyl S/C", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*4.2.*S/C.*", "4.2 ltr V8 S/C", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*4.0.*v8$", "4.0 ltr V8", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*4.0.*v-8$", "4.0 ltr V8", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*4.0.*SE$", "4.0 ltr V8", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*4.2.*V.*8$", "4.2 ltr V8", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*4.2.*6.*", "4.2 ltr 6 cyl", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*4.0.*8.*S/C$", "4.0 ltr V8 S/C", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub(".*4.0.*V6.*", "4.0 ltr V6", update.fitted$engtype, ignore.case = TRUE)
+update.fitted$engtype <- gsub("4.0 ltr.*6 cyl$", "4.0 ltr 6 cyl", update.fitted$engtype, ignore.case = TRUE)
+
+```
+
+Imputing missing engine information based on model.
+
+```{r Imputing engine size}
+
+update.fitted$engtype[which(update.fitted$model == "FRELANDR")] <- "2.5 ltr V6"
+update.fitted$engtype[which(update.fitted$model == "XF")] <- "4.2 ltr V8"
+update.fitted$engtype[which(update.fitted$model == "XJ6/1")] <- "4.2 ltr 6 cyl"
+update.fitted$engtype[which(update.fitted$model == "XJ6/2")] <- "4.2 ltr 6 cyl"
+update.fitted$engtype[which(update.fitted$model == "XJ6/3")] <- "4.2 ltr 6 cyl"
+update.fitted$engtype[which(update.fitted$model == "XJ6/5")] <- "4.0 ltr 6 cyl"
+update.fitted$engtype[grep("XJ12/4", update.fitted$model)] <- "6.0 ltr V12"
+update.fitted$engtype[grep("XJ12/5", update.fitted$model)] <- "6.0 ltr V12"
+update.fitted$engtype[grep("^XJ12", update.fitted$model)] <- "5.3 ltr V12"
+update.fitted$engtype[grep(".*XJ6.*4.0.*", update.fitted$model)] <- "4.0 ltr 6 cyl"
+update.fitted$engtype[grep(".*XJ.*S.*4.0.*", update.fitted$model)] <- "4.0 ltr 6 cyl"
+update.fitted$engtype[grep(".*5.3.*", update.fitted$model)] <- "5.3 ltr V12"
+update.fitted$engtype[grep(".*3.6.*", update.fitted$model)] <- "3.6 ltr 6 cyl"
+update.fitted$engtype[grep("XJS/1", update.fitted$model)] <- "5.3 ltr V12"
+update.fitted$engtype[grep("XJS/HE", update.fitted$model)] <- "5.3 ltr V12"
+update.fitted$byear[intersect(grep("XJS.*4.*", update.fitted$model), which(update.fitted$byear == 1990))] <- 1993
+
+```
+
+While many parts are specific to one model engine size or another, some fit the same car regardless of engine size.  Because our online back-end must have each of these engine options listed separately, items that fit models with multiple engines have to be split into multiple records.  To do this, we identify which of those parts fit that criteria and create a separate table for them.  Note that the original update.fitted table still has those same listings in it.
+
+```{r Multiple fits}
+
+update.fitted$engtype[which(is.na(update.fitted$engtype))] <- "ALL MODELS"
+all <- data.frame(update.fitted[which(update.fitted$engtype == "ALL MODELS"),])
+
+```
+
+We update the main update.fitted table by changing any part that fits "All Models" to one of the engine sizes that corresponds to that particular model.
+
+```{r All models}
+
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "COUNTY")] <- "3.9 ltr V8"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "DISCO II" & update.fitted$byear < 2002)] <- "4.0 ltr V8"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "DISCO I" & update.fitted$byear < 1996)] <- "3.9 ltr V8"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "LR3")] <- "4.0 ltr V6"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "R/ROVER" & update.fitted$byear < 2003)] <- "4.0 ltr V8"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "S-TYPE")] <- "3.0 ltr V6"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "X-TYPE")] <- "3.0 ltr V6"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "XJ6" & update.fitted$byear < 1988)] <- "4.2 ltr 6 cyl"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "XJ6" & update.fitted$byear > 1994)] <- "4.0 ltr 6 cyl"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "XJ6" & update.fitted$byear < 1990 & update.fitted$byear < 1995)] <- "4.0 ltr 6 cyl"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "XJ6/4" & update.fitted$byear < 1990)] <- "3.6 ltr 6 cyl"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "XJ8" & update.fitted$byear < 2004)] <- "4.0 ltr V8"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "XJS" & update.fitted$byear < 1994)] <- "5.3 ltr V12"
+update.fitted$engtype[which(update.fitted$engtype == "ALL MODELS" & update.fitted$model == "XK8" & update.fitted$byear < 2003)] <- "4.0 ltr V8"
+update.fitted <- update.fitted[-which(update.fitted$engtype == "ALL MODELS"),]
+
+```
+
+And then change the 'all' table records to a different engine size (based on model and year) than what was used in the step above.  Since there are no more than 2 engine options for a given year and model range, there's no need to create any more listings since they're all covered by these two tables.
+
+```{r Different engines}
+
+all$engtype[which(all$model == "COUNTY" & all$byear > 1993)] <- "4.2 ltr V8"
+all$engtype[which(all$model == "DISCO II" & all$eyear > 2002)] <- "4.6 ltr V8"
+all$engtype[which(all$model == "DISCO I" & all$eyear > 1995)] <- "4.0 ltr V8"
+all$engtype[which(all$model == "R/ROVER" & all$eyear < 2003)] <- "4.6 ltr V8"
+all$engtype[which(all$model == "R/ROVER" & all$eyear > 2002)] <- "4.4 ltr V8"
+all$engtype[which(all$model == "X-TYPE")] <- "2.5 ltr V6"
+all$engtype[which(all$model == "S-TYPE" & all$eyear > 2002)] <- "4.2 ltr V8"
+all$engtype[which(all$model == "S-TYPE" & all$eyear < 2003)] <- "4.0 ltr V8"
+all$engtype[which(all$model == "XJ6/4" & all$eyear > 1989)] <- "4.0 ltr 6 cyl"
+all$engtype[which(all$model == "XJ8" & all$eyear > 2003 & all$byear < 2004)] <- "4.0 ltr V8 S/C"
+all$engtype[which(all$model == "XK8" & all$eyear > 2002 & all$byear < 2003)] <- "4.0 ltr V8 S/C"
+all$engtype[which(all$model == "XJS" & all$eyear > 1992)] <- "4.0 ltr 6 cyl"
+all <- all[-which(all$engtype == "ALL MODELS"),]
+
+```
+
+Merge both tables back together to get a complete fitment table.
+
+```{r Merge tables}
+
+update.fitted <- rbind(update.fitted, all)
+rm(all)
+
+```
+
+Again, our online store needs information to be entered and formatted in a very precise way.  We have to normalize all of the model names into one of the pre-designated listings that our website uses.  
+
+```{r Normalizing model names}
+
+update.fitted$model <- trimws(update.fitted$model)
+update.fitted$model <- gsub("cnty.*", "Range Rover County", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("county", "Range Rover County", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("df.*", "Defender 90", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub(".*ii.*", "Discovery II", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("disco i.*", "Discovery I", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("dsc.*", "Discovery I", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("disco i.*", "Discovery I", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("fre.*", "Freelander", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("lr3.*", "LR3", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("rr.*sp.*", "Range Rover Sport", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub(".*rr.*", "Range Rover", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub(".*rover.*", "Range Rover", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("^s.*", "S-Type", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("^x .*|^x-type.*", "X-Type", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("XF", "XF/XFR", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("^x .*|^x-type.*", "X-Type", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("xj6.*|xj1.*", "XJ6/XJ12/XJR", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("xj8.*", "XJ8/XJR", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("xjr/5.*", "XJ6/XJ12/XJR", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("xjs.*", "XJS", update.fitted$model, ignore.case = TRUE)
+update.fitted$model <- gsub("xk8.*", "XK8/XKR", update.fitted$model, ignore.case = TRUE)
+
+```
+
+Identified and removed a field that was not needed.  Should've been done earlier.
+
+```{r}
+
+update.fitted <- select(update.fitted, -modellong)
+
+```
+
+Now that the model names are standardized and the engine sizes imputed, we have to go back and correct year fitments that don't correspond to a given engine size.  Example:  In the original data, a part for a "Discovery I" that fits "All Engines" from 1994 to 1999 would now show that it fits 3.9L engines and 4.0L engines from 1994 to 1999.  However, the 3.9L engine was only offered in 1994 and 1995.  The 4.0L engine was offered from 1996 to 1999.  We have to go in and change the year fitment based on the years that the particular engines were offered.
+
+```{r Updating year/engines}
+
+update.fitted$eyear[which(update.fitted$model == "Discovery I" & update.fitted$byear < 1996)] <- 1995
+update.fitted$byear[which(update.fitted$model == "Discovery I" & update.fitted$eyear > 1995)] <- 1996
+update.fitted$eyear[which(update.fitted$model == "Discovery II" & update.fitted$byear < 2003)] <- 2002
+update.fitted$byear[which(update.fitted$model == "Discovery II" & update.fitted$eyear > 2002)] <- 2003
+update.fitted$eyear[which(update.fitted$model == "Range Rover" & update.fitted$byear > 2002)] <- 2005
+update.fitted$eyear[which(update.fitted$model == "XJ6/XJ12/XJR" & update.fitted$byear > 1987 & update.fitted$byear < 1990)] <- 1989
+update.fitted$byear[which(update.fitted$model == "XJ6/XJ12/XJR" & update.fitted$byear > 1989 & update.fitted$byear < 1995)] <- 1990
+update.fitted$eyear[which(update.fitted$model == "XK8/XKR" & update.fitted$byear > 1996 & update.fitted$byear < 2003)] <- 2002
+update.fitted$byear[which(update.fitted$model == "XK8/XKR" & update.fitted$eyear > 2002)] <- 2003
+update.fitted$byear[which(update.fitted$model == "XJS" & update.fitted$engtype == "4.0 ltr 6 cyl")] <- 1993
+update.fitted$eyear[which(update.fitted$model == "XJS" & update.fitted$engtype == "5.3 ltr V12")] <- 1993
+
+```
+
+Since we are adding parts to an online store that will be shipped, we must add in a "shipping weight" field so that we can provide the UPS and USPS API accurate information for determining shipping cost. Because there's no readily available information regarding shipping weights, we decided to base it strictly off of a simple price formula.  This is based on the simple assumption that smaller parts will likely be cheaper.  It's not 100% accurate, but it's simple and fairly effective.
+
+```{r Shipping weight}
+
+update.fitted <- update.fitted %>% mutate(weight = case_when(price < 35 ~ 0.4,
+                                                             price > 300 ~ 15,
+                                                             TRUE ~ 4))
+
+```
+
+Generating/formatting other fields required by our online store CMS.
+
+```{r Formatting and SKU creation}
+
+update.fitted$sku <- 99000:(99000 + nrow(update.fitted) - 1)
+update.fitted$manufacturer <- case_when(update.fitted$manufacturer == "ROV" ~ "Land Rover",
+                                        update.fitted$manufacturer == "JAG" ~ "Jaguar")
+update.fitted$desc <- trimws(update.fitted$desc)
+update.fitted$desc1 <- trimws(update.fitted$desc1)
+update.fitted$desc2 <- trimws(update.fitted$desc2)
+update.fitted$desc <- gsub("\"", "", update.fitted$desc)
+update.fitted$desc1 <- gsub("\"", "", update.fitted$desc1)
+update.fitted$desc2 <- gsub("\"", "", update.fitted$desc2)
+
+```
+
+Many car parts are specific to one side or another and to fore/aft location.  Since there are several ways to denote that, we wanted to normalize these terms in such a way that it is clear what is meant.
+
+```{r Star or port}
+
+update.fitted$desc <- gsub("rhf", "right/front", update.fitted$desc, ignore.case = TRUE)
+update.fitted$desc <- gsub("lhf", "left/front", update.fitted$desc, ignore.case = TRUE)
+update.fitted$desc <- gsub("rhr", "right/rear", update.fitted$desc, ignore.case = TRUE)
+update.fitted$desc <- gsub("lhr", "left/rear", update.fitted$desc, ignore.case = TRUE)
+update.fitted$desc1 <- gsub("rhf", "right/front", update.fitted$desc1, ignore.case = TRUE)
+update.fitted$desc1 <- gsub("lhf", "left/front", update.fitted$desc1, ignore.case = TRUE)
+update.fitted$desc1 <- gsub("rhr", "right/rear", update.fitted$desc1, ignore.case = TRUE)
+update.fitted$desc1 <- gsub("lhr", "left/rear", update.fitted$desc1, ignore.case = TRUE)
+update.fitted$desc2 <- gsub("rhf", "right/front", update.fitted$desc2, ignore.case = TRUE)
+update.fitted$desc2 <- gsub("lhf", "left/front", update.fitted$desc2, ignore.case = TRUE)
+update.fitted$desc2 <- gsub("rhr", "right/rear", update.fitted$desc2, ignore.case = TRUE)
+update.fitted$desc2 <- gsub("lhr", "left/rear", update.fitted$desc2, ignore.case = TRUE)
+update.fitted$desc <- gsub("rf", "right/front", update.fitted$desc, ignore.case = TRUE)
+update.fitted$desc <- gsub("lf", "left/front", update.fitted$desc, ignore.case = TRUE)
+update.fitted$desc <- gsub("rr ", "right/rear ", update.fitted$desc, ignore.case = TRUE)
+update.fitted$desc <- gsub("lr", "left/rear", update.fitted$desc, ignore.case = TRUE)
+update.fitted$desc1 <- gsub("rf", "right/front", update.fitted$desc1, ignore.case = TRUE)
+update.fitted$desc1 <- gsub("lf", "left/front", update.fitted$desc1, ignore.case = TRUE)
+update.fitted$desc1 <- gsub("rr ", "right/rear ", update.fitted$desc1, ignore.case = TRUE)
+update.fitted$desc1 <- gsub("lr", "left/rear", update.fitted$desc1, ignore.case = TRUE)
+update.fitted$desc2 <- gsub("rf", "right/front", update.fitted$desc2, ignore.case = TRUE)
+update.fitted$desc2 <- gsub("lf", "left/front", update.fitted$desc2, ignore.case = TRUE)
+update.fitted$desc2 <- gsub("rr ", "right/rear ", update.fitted$desc2, ignore.case = TRUE)
+update.fitted$desc2 <- gsub("lr", "left/rear", update.fitted$desc2, ignore.case = TRUE)
+update.fitted$desc <- gsub("rh", "right", update.fitted$desc, ignore.case = TRUE)
+update.fitted$desc1 <- gsub("rh", "right", update.fitted$desc1, ignore.case = TRUE)
+update.fitted$desc2 <- gsub("rh ", "right", update.fitted$desc2, ignore.case = TRUE)
+update.fitted$desc <- gsub("lh", "left", update.fitted$desc, ignore.case = TRUE)
+update.fitted$desc1 <- gsub("lh", "left", update.fitted$desc1, ignore.case = TRUE)
+update.fitted$desc2 <- gsub("lh ", "left", update.fitted$desc2, ignore.case = TRUE)
+
+```
+
+Removing extraneous or unclear characters from description fields
+
+```{r Some more data cleaning}
+
+update.fitted$desc <- gsub(" [:alpha:] ", " ", update.fitted$desc, ignore.case = TRUE)
+update.fitted$desc1 <- gsub(" [:alpha:] ", " ", update.fitted$desc1, ignore.case = TRUE)
+update.fitted$desc2 <- gsub(" [:alpha:] ", " ", update.fitted$desc2, ignore.case = TRUE)
+update.fitted$desc <- gsub("?", "", update.fitted$desc)
+update.fitted$desc1 <- gsub("?", "", update.fitted$desc1)
+update.fitted$desc2 <- gsub("?", "", update.fitted$desc2)
+
+```
+
+Because the names/descriptions of parts were entered in by multiple people over a long period of time for internal use only and were entered with the intent of being easy to use with an outdated search functionality, many of them are not grammatically correct and/or are not written in the same way that most people naturally think or speak.  Many of these will have to be corrected individually, but the front/rear and right/left descriptions are numerous and can be corrected en masse.  Many of these fields read something like this:
+
+"Used door right/front mirror"  
+
+The following code changes these types of descriptions to a more natural phrase:
+
+"Used right/front door mirror"
+
+```{r Natural language}
+
+update.fitted$desc[grep("right/front", update.fitted$desc)] <- paste("right/front", 
+                            gsub("right/front ", "", update.fitted$desc[grep("right/front", update.fitted$desc)]),
+                            col = " ")
+update.fitted$desc[grep("left/front", update.fitted$desc)] <- paste("left/front", 
+                            gsub("left/front ", "", update.fitted$desc[grep("left/front", update.fitted$desc)]), 
+                            col = " ")
+update.fitted$desc[grep("right/rear", update.fitted$desc)] <- paste("right/rear", 
+                            gsub("right/rear ", "", update.fitted$desc[grep("right/rear", update.fitted$desc)]), 
+                            col = " ")
+update.fitted$desc[grep("left/rear", update.fitted$desc)] <- paste("left/rear", 
+                            gsub("left/rear ", "", update.fitted$desc[grep("left/rear", update.fitted$desc)]), 
+                            col = " ")
+update.fitted$desc[grep("right ", update.fitted$desc)] <- paste("right", 
+                            gsub("right ", "", update.fitted$desc[grep("right ", update.fitted$desc)]), 
+                            col = " ")
+update.fitted$desc[grep("left ", update.fitted$desc)] <- paste("left", 
+                            gsub("left ", "", update.fitted$desc[grep("left ", update.fitted$desc)]), 
+                            col = " ")
+update.fitted$desc1[grep("right/front", update.fitted$desc1)] <- paste("right/front", 
+                            gsub("right/front ", "", update.fitted$desc1[grep("right/front", update.fitted$desc1)]), col = " ")
+update.fitted$desc1[grep("left/front", update.fitted$desc1)] <- paste("left/front", 
+                            gsub("left/front ", "", update.fitted$desc1[grep("left/front", update.fitted$desc1)]),
+                            col = " ")
+update.fitted$desc1[grep("right/rear", update.fitted$desc1)] <- paste("right/rear", 
+                            gsub("right/rear ", "", update.fitted$desc1[grep("right/rear", update.fitted$desc1)]),                             col = " ")
+update.fitted$desc1[grep("left/rear", update.fitted$desc1)] <- paste("left/rear", 
+                            gsub("left/rear ", "", update.fitted$desc1[grep("left/rear", update.fitted$desc1)]), 
+                            col = " ")
+update.fitted$desc1[grep("right ", update.fitted$desc1)] <- paste("right", 
+                            gsub("right ", "", update.fitted$desc1[grep("right ", update.fitted$desc1)]), 
+                            col = " ")
+update.fitted$desc1[grep("left", update.fitted$desc1)] <- paste("left", 
+                            gsub("left ", "", update.fitted$desc1[grep("left", update.fitted$desc1)]), 
+                            col = " ")
+update.fitted$desc2[grep("right/front", update.fitted$desc2)] <- paste("right/front", 
+                            gsub("right/front ", "", update.fitted$desc2[grep("right/front", update.fitted$desc2)]), 
+                            col = " ")
+update.fitted$desc2[grep("left/front", update.fitted$desc2)] <- paste("left/front", 
+                            gsub("left/front ", "", update.fitted$desc2[grep("left/front", update.fitted$desc2)]), 
+                            col = " ")
+update.fitted$desc2[grep("right/rear", update.fitted$desc2)] <- paste("right/rear", 
+                            gsub("right/rear ", "", update.fitted$desc2[grep("right/rear", update.fitted$desc2)]), 
+                            col = " ")
+update.fitted$desc2[grep("left/rear", update.fitted$desc2)] <- paste("left/rear", 
+                            gsub("left/rear ", "", update.fitted$desc2[grep("left/rear", update.fitted$desc2)]), 
+                            col = " ")
+update.fitted$desc2[grep("right ", update.fitted$desc2)] <- paste("right", 
+                            gsub("right ", "", update.fitted$desc2[grep("right ", update.fitted$desc2)]), 
+                            col = " ")
+update.fitted$desc2[grep("left ", update.fitted$desc2)] <- paste("left", 
+                            gsub("left ", "", update.fitted$desc2[grep("left ", update.fitted$desc2)]), 
+                            col = " ")
+
+```
+
+Additional removal of extraneous characters
+
+```{r More data cleaning}
+
+update.fitted$desc <- gsub("\\(.*\\)", "", update.fitted$desc)
+update.fitted$desc1 <- gsub("\\(.*\\)", "", update.fitted$desc1)
+update.fitted$desc2 <- gsub("\\(.*\\)", "", update.fitted$desc2)
+update.fitted$desc <- trimws(update.fitted$desc)
+update.fitted$desc1 <- trimws(update.fitted$desc1)
+update.fitted$desc2 <- trimws(update.fitted$desc2)
+update.fitted$desc <- paste("Used", update.fitted$desc, col = " ")
+update.fitted$desc1[-which(update.fitted$desc1 == "")] <- 
+      paste("Used", update.fitted$desc1[-which(update.fitted$desc1 == "")], col = " ")
+update.fitted$desc2[-which(update.fitted$desc2 == "")] <- 
+      paste("Used", update.fitted$desc2[-which(update.fitted$desc2 == "")], col = " ")
+
+```
+
+Changing character case to mirror the excel "proper" function
+
+```{r Proper caps}
+
+proper <- function(x)
+      paste0(toupper(substr(x, 1, 1)), tolower(substring(x, 2)))
+
+update.fitted$desc <- proper(update.fitted$desc)
+update.fitted$desc1 <- proper(update.fitted$desc1)
+update.fitted$desc2 <- proper(update.fitted$desc2)
+update.fitted$desc2 <- gsub("NANA", "", update.fitted$desc2)
+
+```
+
+# Creating Output File for Upload
+
+Creating the new data table that will be uploaded to our store.  Most fields are simple, but a few are combinations of fields in the update.fitted table.
+
+```{r New upload file}
+
+upload.file <- as.data.frame(matrix(data = NA, ncol = 1, nrow = nrow(update.fitted)))
+upload.file <- upload.file %>% mutate(sku = update.fitted$sku,
+                                      X_store = NA,
+                                      X_attribute_set = "Default",
+                                      X_type = "simple",
+                                      X_category = "Used Parts",
+                                      X_root_category = "Default Category",
+                                      X_product_websites = "base",
+                                      name = trimws(ifelse(update.fitted$desc2 == "", update.fitted$desc, update.fitted$desc2)),
+                                      description = trimws(ifelse(update.fitted$desc1 == "", update.fitted$desc, update.fitted$desc1)),
+                                      short_description = trimws(ifelse(update.fitted$desc1 == "", update.fitted$desc, update.fitted$desc1)),
+                                      price = update.fitted$price,
+                                      special_price = NA,
+                                      special_from_date = NA,
+                                      special_to_date = NA,
+                                      cost = NA,
+                                      weight = update.fitted$weight,
+                                      manufacturer = update.fitted$manufacturer,
+                                      meta_title = trimws(paste("Coventry West | Used", 
+                                                                update.fitted$manufacturer, 
+                                                                "parts for", 
+                                                                update.fitted$byear, 
+                                                                "to", 
+                                                                update.fitted$eyear,
+                                                                update.fitted$model, 
+                                                                col = " ")),
+                                      meta_keyword = trimws(paste(update.fitted$desc, 
+                                                                  "for",
+                                                                  update.fitted$byear,
+                                                                  "to",
+                                                                  update.fitted$eyear,
+                                                                  update.fitted$manufacturer,
+                                                                  update.fitted$model, 
+                                                                  col = " ")),
+                                      meta_description = trimws(paste("Used", 
+                                                                      update.fitted$manufacturer,
+                                                                      update.fitted$model,
+                                                                      "parts from Coventry West", 
+                                                                      col = " ")),
+                                      image = "/u/s/used_image.jpg",
+                                      small_image = "/u/s/used_image.jpg",
+                                      thumbnail = "/u/s/used_image.jpg",
+                                      media_gallery = NA,
+                                      color = NA,
+                                      news_from_date = NA,
+                                      news_to_date = NA,
+                                      gallery = NA, 
+                                      status = 1,
+                                      url_key = trimws(paste(update.fitted$manufacturer,
+                                                             update.fitted$desc,
+                                                             update.fitted$item_code,
+                                                             col = " ")),
+                                      url_path = trimws(paste(url_key, ".html", col = "")),
+                                      minimal_price = NA,
+                                      visibility = 4,
+                                      custom_design = NA,
+                                      custom_design_from = NA, 
+                                      custom_design_to = NA,
+                                      custom_layout_update = NA,
+                                      options_container = "Block After Info Column",
+                                      required_options = 0,
+                                      has_options = 0,
+                                      image_label = NA,
+                                      small_image_label = NA,
+                                      thumbnail_label = NA,
+                                      created_at = NA,
+                                      updated_at = NA, 
+                                      country_of_manufacture = NA,
+                                      msrp_enabled = "Use Config",
+                                      msrp_display_actual_price_type = "Use Config",
+                                      msrp = NA,
+                                      enable_googlecheckout = 1,
+                                      tax_class_id = 2,
+                                      gift_message_available = 0,
+                                      make = update.fitted$manufacturer,
+                                      byear = update.fitted$byear,
+                                      eyear = update.fitted$eyear,
+                                      model = update.fitted$model, 
+                                      engine = update.fitted$engtype,
+                                      part_number = update.fitted$item_code,
+                                      fits = trimws(paste(update.fitted$model, 
+                                                          update.fitted$byear,
+                                                          "to",
+                                                          update.fitted$eyear,
+                                                          col = " ")),
+                                      qty = 100,
+                                      min_qty = 0,
+                                      use_config_min_qty = 0,
+                                      is_qty_decimal = 0,
+                                      backorders = 0,
+                                      use_config_backorders = 1,
+                                      min_sale_qty = 1,
+                                      use_config_min_sale_qty = 1,
+                                      max_sale_qty = 0,
+                                      use_config_max_sale_qty = 1,
+                                      is_in_stock = 1,
+                                      notify_stock_qty = 0,
+                                      use_config_notify_stock_qty = 1,
+                                      manage_stock = 0,
+                                      use_config_manage_stock = 1,
+                                      stock_status_changed_auto = 0,
+                                      use_config_qty_increments = 1,
+                                      qty_increments = 0,
+                                      use_config_enable_qty_inc = 1,
+                                      enable_qty_increments = 0,
+                                      is_decimal_divided = 0,
+                                      X_links_related_sku = NA,
+                                      X_links_related_position = NA,
+                                      X_links_crosssell_sku = NA,
+                                      X_links_crosssell_position = NA,
+                                      X_links_upsell_sku = NA,
+                                      X_links_upsell_position = NA,
+                                      X_associated_sku = NA,
+                                      X_associated_default_qty = NA,
+                                      X_associated_position = NA,
+                                      X_tier_price_website = NA,
+                                      X_tier_price_customer_group = NA,
+                                      X_tier_price_qty = NA,
+                                      X_tier_price_price = NA,
+                                      X_group_price_website = NA,
+                                      X_group_price_customer_group = NA,
+                                      X_group_price_price = NA,
+                                      X_media_attribute_id = 88,
+                                      X_media_image = "/u/s/used_image.jpg",
+                                      X_media_lable = NA,
+                                      X_media_position = 1,
+                                      X_media_is_disabled = 0)
+
+```
+
+Removing extraneous field
+
+```{r Cleaning}
+
+upload.file <- upload.file[,-1]
+
+```
+
+And that's it.  Saving our table-to-be-uploaded into .csv format
+
+```{r Final save}
+
+write.csv(upload.file, "C:\\Fitrix Data Tables for R\\Used\\used_upload_file.csv")
+
+```
