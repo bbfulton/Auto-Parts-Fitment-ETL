@@ -4,4 +4,4 @@
 
 This is an ETL project that takes product information from our point of sale system and builds a new table that can be uploaded to our online store content management system (Magento). 
 
-To view the rendered HTML code page:  https://htmlpreview.github.io/?https://github.com/bbfulton/PartsETL/blob/master/usedparts_website.html
+To view the rendered HTML code page:  https://htmlpreview.github.io/?https://github.com/bbfulton/Auto-Parts-Fitment-ETL/blob/master/usedparts_website.html
